@@ -1,199 +1,255 @@
-import os, json, sqlite3, secrets, hmac, ipaddress, socket
+import os, json, secrets, hmac, re, ipaddress, socket
 from datetime import datetime, timezone
 from functools import wraps
-from urllib.parse import urlsplit
+from urllib.parse import urlparse
 import requests
-from flask import Flask, request, redirect, url_for, session, render_template_string, flash, jsonify, abort
-from werkzeug.security import check_password_hash, generate_password_hash
-from dotenv import load_dotenv
+from cryptography.fernet import Fernet, InvalidToken
+from flask import Flask, request, session, redirect, url_for, abort, flash, render_template
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
 
-load_dotenv()
-app = Flask(__name__)
-app.secret_key = os.environ.get('APP_SECRET') or secrets.token_hex(32)
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE','false').lower()=='true', MAX_CONTENT_LENGTH=1024*1024)
-DB = os.environ.get('DATABASE_PATH', os.path.join(os.path.dirname(__file__), 'data', 'flowpilot.db'))
-ADMIN = os.environ.get('ADMIN_USERNAME','admin')
-PASSWORD = os.environ.get('ADMIN_PASSWORD','')
-BASE = os.environ.get('PUBLIC_BASE_URL','http://localhost:8000').rstrip('/')
-if not PASSWORD: raise RuntimeError('Set ADMIN_PASSWORD in .env')
+app=Flask(__name__)
+app.secret_key=os.environ.get('APP_SECRET') or secrets.token_urlsafe(48)
+app.config['SESSION_COOKIE_HTTPONLY']=True
+app.config['SESSION_COOKIE_SAMESITE']='Lax'
+app.config['SESSION_COOKIE_SECURE']=os.environ.get('COOKIE_SECURE','false').lower()=='true'
+app.config['MAX_CONTENT_LENGTH']=1024*1024
+rawdb=os.environ.get('DATABASE_URL','sqlite:////app/data/flowpilot.db')
+if rawdb.startswith('postgres://'): rawdb='postgresql+psycopg://'+rawdb[len('postgres://'):]
+if rawdb.startswith('postgresql://'): rawdb='postgresql+psycopg://'+rawdb[len('postgresql://'):]
+app.config['SQLALCHEMY_DATABASE_URI']=rawdb
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS']=False
+app.config['SQLALCHEMY_ENGINE_OPTIONS']={'pool_pre_ping':True}
+db=SQLAlchemy(app)
+ADMIN=os.environ.get('ADMIN_USERNAME','admin')
+PASSWORD=os.environ.get('ADMIN_PASSWORD','')
+FKEY=os.environ.get('ENCRYPTION_KEY','')
+if not PASSWORD: raise RuntimeError('Set ADMIN_PASSWORD in Render Environment')
+if not FKEY: raise RuntimeError('Set ENCRYPTION_KEY with a Fernet key in Render Environment')
+fernet=Fernet(FKEY.encode())
 
-def db():
-    os.makedirs(os.path.dirname(os.path.abspath(DB)),exist_ok=True)
-    c=sqlite3.connect(DB,timeout=30)
-    c.row_factory=sqlite3.Row
-    return c
+class Connection(db.Model):
+    id=db.Column(db.Integer,primary_key=True)
+    name=db.Column(db.String(100),nullable=False)
+    kind=db.Column(db.String(40),nullable=False)
+    secret=db.Column(db.Text,nullable=False)
+    created=db.Column(db.DateTime,default=lambda: datetime.now(timezone.utc))
 
-def init_db():
-    with db() as c:
-        c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
-        c.execute('''CREATE TABLE IF NOT EXISTS workflows (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, token TEXT UNIQUE NOT NULL, method TEXT NOT NULL DEFAULT 'POST', destination TEXT NOT NULL, headers TEXT NOT NULL DEFAULT '{}', payload TEXT NOT NULL DEFAULT '{{payload}}', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id INTEGER NOT NULL, timestamp TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, FOREIGN KEY(workflow_id) REFERENCES workflows(id))''')
-        if not c.execute("SELECT 1 FROM settings WHERE key='admin_hash'").fetchone():
-           c.execute(
-    "INSERT OR IGNORE INTO settings VALUES (?,?)",
-    ('admin_hash', generate_password_hash(PASSWORD))
-)
-init_db()
+class Workflow(db.Model):
+    id=db.Column(db.Integer,primary_key=True)
+    name=db.Column(db.String(160),nullable=False)
+    trigger_token=db.Column(db.String(128),unique=True,nullable=False,default=lambda: secrets.token_urlsafe(32))
+    action=db.Column(db.String(40),nullable=False)
+    connection_id=db.Column(db.Integer,db.ForeignKey('connection.id'),nullable=True)
+    config=db.Column(db.Text,nullable=False,default='{}')
+    enabled=db.Column(db.Boolean,nullable=False,default=True)
+    created=db.Column(db.DateTime,default=lambda: datetime.now(timezone.utc))
+    connection=db.relationship('Connection')
 
-def authenticated(): return session.get('user')==ADMIN
+class Run(db.Model):
+    id=db.Column(db.Integer,primary_key=True)
+    workflow_id=db.Column(db.Integer,db.ForeignKey('workflow.id'),nullable=False)
+    status=db.Column(db.String(30),nullable=False)
+    message=db.Column(db.Text,nullable=False)
+    created=db.Column(db.DateTime,default=lambda: datetime.now(timezone.utc))
+    workflow=db.relationship('Workflow')
 
-def login_required(f):
-    @wraps(f)
-    def wrapped(*args,**kwargs):
-        if not authenticated(): return redirect(url_for('login'))
-        return f(*args,**kwargs)
-    return wrapped
+with app.app_context(): db.create_all()
 
-@app.before_request
-def csrf_protect():
-    if 'csrf' not in session: session['csrf']=secrets.token_urlsafe(32)
-    if request.method in ('POST','PUT','PATCH','DELETE') and not request.path.startswith('/hook/'):
-        if not hmac.compare_digest(request.form.get('csrf',''),session['csrf']): abort(403)
+CATALOG=[('webhook','Webhook / API','Готовий тригер та універсальний HTTP-запит','ready'),('telegram','Telegram','Надіслати повідомлення через Bot API','ready'),('openai','OpenAI','Виконати запит до Responses API','ready'),('sheets','Google Sheets','Додати рядок у таблицю через OAuth access token','token'),('gmail','Gmail','Надіслати лист через OAuth access token','token'),('facebook','Facebook Pages','Створити допис на сторінці','token'),('instagram','Instagram','Публікація через Instagram Graph API','planned'),('googleads','Google Ads','Підготовлено місце під OAuth + developer token','planned'),('crm','CRM / Custom API','Універсальна передача даних у CRM через HTTP','ready')]
 
 @app.context_processor
-def inject(): return dict(csrf=session.get('csrf'), base=BASE)
+def globals_():
+    return dict(catalog=CATALOG,username=ADMIN)
 
-CSS='''<style>:root{font-family:Inter,system-ui,-apple-system,sans-serif;color:#e9eafa;background:#0b1020}*{box-sizing:border-box}body{margin:0}a{color:#9fb8ff;text-decoration:none}.shell{display:flex;min-height:100vh}aside{width:230px;background:#111a2e;padding:28px 18px;border-right:1px solid #263047}aside a{display:block;padding:12px;border-radius:10px;color:#adb9d0;margin:9px 0}aside a:hover{background:#23304b;color:#fff}.logo{font-size:24px;font-weight:800;margin-bottom:36px;color:#fff}main{padding:40px;flex:1;max-width:1250px}h1{margin:0 0 8px}p,.muted{color:#9caac4}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:26px;gap:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.card{background:#151f34;border:1px solid #2b3955;border-radius:15px;padding:22px}.num{font-size:32px;font-weight:800;color:#fff}button,.btn{background:#657dff;color:#fff;border:0;padding:11px 17px;border-radius:9px;font-weight:700;cursor:pointer;display:inline-block}button.secondary,.btn.secondary{background:#293953}input,textarea,select{width:100%;background:#0f172a;color:#fff;border:1px solid #405070;padding:12px;border-radius:8px;margin:7px 0 18px;font:inherit}textarea{min-height:115px}label{font-weight:650;font-size:14px}table{width:100%;border-collapse:collapse}td,th{padding:15px 12px;text-align:left;border-bottom:1px solid #2b3955}th{color:#9caac4;font-size:13px}.tag{border-radius:20px;padding:5px 10px;background:#1a654e;color:#b4f6d5;font-size:12px}.off{background:#5a3542;color:#ffd5df}.notice{padding:12px 16px;background:#283a60;border-radius:8px;margin-bottom:18px}.mono{font-family:monospace;overflow-wrap:anywhere}.steps{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.step{border:1px solid #3e4f77;padding:14px;border-radius:10px;background:#202c46}@media(max-width:760px){.shell{display:block}aside{width:100%;padding:16px}aside a{display:inline-block}.logo{margin:0}main{padding:18px}} </style>'''
-LAYOUT='''<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FlowPilot</title>'''+CSS+'''</head><body><div class="shell"><aside><div class="logo">◈ FlowPilot</div><div class="muted">Особиста автоматизація</div><a href="{{url_for('index')}}">▦ Огляд</a><a href="{{url_for('new_workflow')}}">＋ Новий сценарій</a><a href="{{url_for('history')}}">◷ Історія запусків</a><form method="post" action="{{url_for('logout')}}"><input type="hidden" name="csrf" value="{{csrf}}"><button class="secondary" style="margin-top:20px">Вийти</button></form></aside><main>{% with msgs=get_flashed_messages() %}{% for m in msgs %}<div class="notice">{{m}}</div>{% endfor %}{% endwith %}{{body|safe}}</main></div></body></html>'''
+def login_required(fn):
+    @wraps(fn)
+    def inner(*a,**kw):
+        if session.get('authenticated') is not True: return redirect(url_for('login'))
+        return fn(*a,**kw)
+    return inner
 
-def page(template,**kwargs):
-    from flask import render_template_string as render
-    body=render(template,**kwargs)
-    return render(LAYOUT,body=body)
+def csrf_check():
+    if request.method in ('POST','PUT','PATCH','DELETE') and not request.path.startswith('/hook/'):
+        supplied=request.form.get('_csrf','')
+        if not hmac.compare_digest(supplied,session.get('csrf','')): abort(403)
+@app.before_request
+def before():
+    if 'csrf' not in session: session['csrf']=secrets.token_urlsafe(32)
+    csrf_check()
+@app.context_processor
+def csrf(): return dict(csrf=session.get('csrf',''))
 
-LOGIN='''<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'''+CSS+'''</head><body><div class="card" style="max-width:420px;margin:12vh auto"><h1>◈ FlowPilot</h1><p>Приватний кабінет інтеграцій</p>{% with msgs=get_flashed_messages() %}{% for m in msgs %}<div class="notice">{{m}}</div>{% endfor %}{% endwith %}<form method="post"><input type="hidden" name="csrf" value="{{csrf}}"><label>Логін</label><input name="username" required><label>Пароль</label><input type="password" name="password" required><button style="width:100%">Увійти</button></form></div></body></html>'''
+@app.route('/health')
+def health(): return {'status':'ok'}
 @app.route('/login',methods=['GET','POST'])
 def login():
     if request.method=='POST':
-        with db() as c: row=c.execute("SELECT value FROM settings WHERE key='admin_hash'").fetchone()
-        if hmac.compare_digest(request.form.get('username',''),ADMIN) and check_password_hash(row['value'],request.form.get('password','')):
-            session.clear(); session['user']=ADMIN; session['csrf']=secrets.token_urlsafe(32)
-            return redirect(url_for('index'))
-        flash('Неправильний логін або пароль')
-    return render_template_string(LOGIN)
-
+        if hmac.compare_digest(request.form.get('username',''),ADMIN) and hmac.compare_digest(request.form.get('password',''),PASSWORD):
+            session.clear();session['authenticated']=True;session['csrf']=secrets.token_urlsafe(32)
+            return redirect(url_for('dashboard'))
+        flash('Неправильний логін або пароль','error')
+    return render_template('login.html')
 @app.post('/logout')
-def logout(): session.clear(); return redirect(url_for('login'))
-
-INDEX='''<div class="top"><div><h1>Панель керування</h1><p>Усі автоматизації під твоїм контролем.</p></div><a class="btn" href="{{url_for('new_workflow')}}">+ Створити сценарій</a></div><div class="grid"><div class="card"><div class="muted">Усього сценаріїв</div><div class="num">{{stats.total}}</div></div><div class="card"><div class="muted">Активні</div><div class="num">{{stats.active}}</div></div><div class="card"><div class="muted">Запусків</div><div class="num">{{stats.runs}}</div></div></div><h2 style="margin-top:35px">Мої інтеграції</h2><div class="card">{% if items %}<table><thead><tr><th>Назва</th><th>Маршрут</th><th>Статус</th><th>Дії</th></tr></thead><tbody>{% for i in items %}<tr><td><b>{{i.name}}</b></td><td>Webhook → HTTP {{i.method}}</td><td><span class="tag {{'off' if not i.enabled}}">{{'Увімкнено' if i.enabled else 'Вимкнено'}}</span></td><td><a href="{{url_for('edit_workflow',wid=i.id)}}">Відкрити →</a></td></tr>{% endfor %}</tbody></table>{% else %}<p>Сценаріїв поки немає. Створи першу інтеграцію.</p>{% endif %}</div>'''
-@app.get('/')
 @login_required
-def index():
-    with db() as c:
-        items=c.execute('SELECT * FROM workflows ORDER BY id DESC').fetchall()
-        stats=dict(total=c.execute('SELECT count(*) FROM workflows').fetchone()[0],active=c.execute('SELECT count(*) FROM workflows WHERE enabled=1').fetchone()[0],runs=c.execute('SELECT count(*) FROM runs').fetchone()[0])
-    return page(INDEX,items=items,stats=stats)
+def logout(): session.clear();return redirect(url_for('login'))
+@app.route('/')
+@login_required
+def dashboard():
+    return render_template('dashboard.html',n=Workflow.query.count(),success=Run.query.filter_by(status='success').count(),fails=Run.query.filter_by(status='error').count(),recent=Run.query.order_by(Run.id.desc()).limit(8).all())
+@app.route('/catalog')
+@login_required
+def catalog():return render_template('catalog.html')
+@app.route('/connections',methods=['GET','POST'])
+@login_required
+def connections():
+    if request.method=='POST':
+        name=request.form.get('name','').strip()[:100];kind=request.form.get('kind','').strip();token=request.form.get('token','').strip()
+        if not name or not token or kind not in ('telegram','openai','sheets','gmail','facebook','http'):flash('Заповни поля','error')
+        else:
+            db.session.add(Connection(name=name,kind=kind,secret=fernet.encrypt(token.encode()).decode()));db.session.commit();flash('Підключення додано','success')
+        return redirect(url_for('connections'))
+    return render_template('connections.html',items=Connection.query.order_by(Connection.id.desc()).all())
+@app.post('/connections/<int:cid>/delete')
+@login_required
+def connection_delete(cid):
+    c=db.get_or_404(Connection,cid)
+    if Workflow.query.filter_by(connection_id=cid).first(): flash('Спочатку видали сценарії з цим підключенням','error')
+    else:db.session.delete(c);db.session.commit()
+    return redirect(url_for('connections'))
 
-EDITOR='''<div class="top"><div><h1>{{'Редагувати сценарій' if item else 'Новий сценарій'}}</h1><p>Вебхук запускає HTTP-запит до обраного сервісу.</p></div><a class="btn secondary" href="{{url_for('index')}}">← Назад</a></div><div class="steps"><div class="step">⚡ Вхідний Webhook</div><span>→</span><div class="step">⇄ Підстановка полів</div><span>→</span><div class="step">↗ HTTP-дія</div></div><form method="post" class="card" style="max-width:900px;margin-top:22px"><input type="hidden" name="csrf" value="{{csrf}}"><label>Назва інтеграції</label><input name="name" value="{{item.name if item else ''}}" placeholder="Заявки з сайту → CRM" required maxlength="120"><label>URL сервісу-отримувача (тільки HTTPS)</label><input name="destination" type="url" value="{{item.destination if item else ''}}" placeholder="https://api.example.com/v1/leads" required><label>HTTP-метод</label><select name="method">{% for m in ['POST','PUT','PATCH'] %}<option value="{{m}}" {{'selected' if item and item.method==m}}>{{m}}</option>{% endfor %}</select><label>Заголовки HTTP (JSON; наприклад, Authorization)</label><textarea name="headers" spellcheck="false">{{item.headers if item else '{"Content-Type": "application/json"}'}}</textarea><label>Шаблон тіла запиту (JSON, доступні {{'{{payload}}'}} та {{'{{payload.field}}'}})</label><textarea name="payload" spellcheck="false">{{item.payload if item else '{"name":"{{payload.name}}","email":"{{payload.email}}"}'}}</textarea><label><input type="checkbox" name="enabled" style="width:auto;margin:12px" {{'checked' if not item or item.enabled}}> Активний сценарій</label><div><button>Зберегти інтеграцію</button></div></form>{% if item %}<div class="card" style="max-width:900px;margin-top:18px"><h2>Webhook URL</h2><div class="mono">{{base}}/hook/{{item.token}}</div><p>Надішли POST-запит з JSON. Токен у URL є секретним — не публікуй його.</p><form method="post" action="{{url_for('manual_run',wid=item.id)}}"><input type="hidden" name="csrf" value="{{csrf}}"><label>Тестові дані (JSON)</label><textarea name="data">{"name":"Тестовий клієнт","email":"test@example.com"}</textarea><button>▶ Тестовий запуск</button></form><form method="post" action="{{url_for('delete_workflow',wid=item.id)}}" onsubmit="return confirm('Видалити сценарій?')" style="margin-top:22px"><input type="hidden" name="csrf" value="{{csrf}}"><button class="secondary">Видалити сценарій</button></form></div>{% endif %}'''
-
-def validate_destination(url):
-    u=urlsplit(url)
-    if u.scheme!='https' or not u.hostname or u.username or u.password or u.port not in (None,443): raise ValueError('Потрібна HTTPS-адреса без логіна, пароля та нестандартного порту')
-    addresses=socket.getaddrinfo(u.hostname,443,type=socket.SOCK_STREAM)
-    if not addresses: raise ValueError('Не вдалося знайти адресу')
-    for addr in addresses:
-        ip=ipaddress.ip_address(addr[4][0])
-        if not ip.is_global: raise ValueError('Локальні та приватні адреси заборонені')
-    return url
-
-def form_values():
-    name=request.form.get('name','').strip()[:120]
-    if not name: raise ValueError('Вкажи назву')
-    destination=validate_destination(request.form.get('destination','').strip())
-    method=request.form.get('method','POST')
-    if method not in ('POST','PUT','PATCH'): raise ValueError('Недозволений HTTP метод')
-    headers=request.form.get('headers','{}'); payload=request.form.get('payload','{}')
-    h=json.loads(headers); json.loads(payload)
-    if not isinstance(h,dict) or any(not isinstance(k,str) or not isinstance(v,str) for k,v in h.items()): raise ValueError('Заголовки мають бути JSON-об’єктом рядків')
-    if any(k.lower() in ('host','content-length','transfer-encoding','connection') for k in h): raise ValueError('Заборонений системний заголовок')
-    return (name,method,destination,headers,payload,1 if request.form.get('enabled') else 0)
-
+def config_for_form(form):
+    data={k:form.get(k,'').strip() for k in ('url','method','headers','body','chat_id','prompt','spreadsheet_id','range','to','subject','message','page_id','source')}
+    if data['headers']:json.loads(data['headers'])
+    return json.dumps(data,ensure_ascii=False)
+@app.route('/workflows')
+@login_required
+def workflows():return render_template('workflows.html',items=Workflow.query.order_by(Workflow.id.desc()).all())
 @app.route('/workflows/new',methods=['GET','POST'])
 @login_required
-def new_workflow():
+def workflow_new():
     if request.method=='POST':
-        try:
-            vals=form_values()
-            with db() as c:
-                cur=c.execute('INSERT INTO workflows(name,method,destination,headers,payload,enabled,token,created_at) VALUES (?,?,?,?,?,?,?,?)',(*vals,secrets.token_urlsafe(32),datetime.now(timezone.utc).isoformat()))
-                wid=cur.lastrowid
-            flash('Інтеграцію створено'); return redirect(url_for('edit_workflow',wid=wid))
-        except (ValueError,json.JSONDecodeError,OSError) as e: flash('Помилка: '+str(e))
-    return page(EDITOR,item=None)
-
-@app.route('/workflows/<int:wid>',methods=['GET','POST'])
+        action=request.form.get('action','http');name=request.form.get('name','').strip()[:160]
+        conn_id=request.form.get('connection_id','').strip()
+        if action not in ('http','telegram','openai','sheets','gmail','facebook') or not name:flash('Перевір назву й дію','error')
+        else:
+            try:
+                config=config_for_form(request.form)
+                conn=db.session.get(Connection,int(conn_id)) if conn_id else None
+                if conn_id and not conn:raise ValueError('Підключення не знайдено')
+                obj=Workflow(name=name,action=action,config=config,connection_id=conn.id if conn else None)
+                db.session.add(obj);db.session.commit();flash('Сценарій створено','success');return redirect(url_for('workflow_detail',wid=obj.id))
+            except (ValueError,TypeError,json.JSONDecodeError) as e:flash(f'Помилка конфігурації: {e}','error')
+    return render_template('workflow_form.html',connections=Connection.query.all())
+@app.route('/workflows/<int:wid>')
 @login_required
-def edit_workflow(wid):
-    with db() as c: item=c.execute('SELECT * FROM workflows WHERE id=?',(wid,)).fetchone()
-    if not item: abort(404)
-    if request.method=='POST':
-        try:
-            vals=form_values()
-            with db() as c: c.execute('UPDATE workflows SET name=?,method=?,destination=?,headers=?,payload=?,enabled=? WHERE id=?',(*vals,wid))
-            flash('Зміни збережено');return redirect(url_for('edit_workflow',wid=wid))
-        except (ValueError,json.JSONDecodeError,OSError) as e: flash('Помилка: '+str(e))
-    return page(EDITOR,item=item)
-
+def workflow_detail(wid):
+    w=db.get_or_404(Workflow,wid)
+    return render_template('workflow_detail.html',w=w,cfg=json.loads(w.config),runs=Run.query.filter_by(workflow_id=wid).order_by(Run.id.desc()).limit(20).all())
+@app.post('/workflows/<int:wid>/toggle')
+@login_required
+def workflow_toggle(wid):
+    w=db.get_or_404(Workflow,wid);w.enabled=not w.enabled;db.session.commit();return redirect(url_for('workflow_detail',wid=wid))
 @app.post('/workflows/<int:wid>/delete')
 @login_required
-def delete_workflow(wid):
-    with db() as c:
-        c.execute('DELETE FROM runs WHERE workflow_id=?',(wid,))
-        c.execute('DELETE FROM workflows WHERE id=?',(wid,))
-    flash('Сценарій видалено');return redirect(url_for('index'))
+def workflow_delete(wid):
+    w=db.get_or_404(Workflow,wid);Run.query.filter_by(workflow_id=wid).delete();db.session.delete(w);db.session.commit();return redirect(url_for('workflows'))
 
-def interpolate(obj, data):
-    if isinstance(obj,dict): return {k:interpolate(v,data) for k,v in obj.items()}
-    if isinstance(obj,list): return [interpolate(v,data) for v in obj]
-    if not isinstance(obj,str): return obj
-    if obj=='{{payload}}': return data
-    if obj.startswith('{{payload.') and obj.endswith('}}'):
-        key=obj[10:-2];return data.get(key,'') if isinstance(data,dict) else ''
-    import re
-    return re.sub(r'\{\{payload\.([a-zA-Z0-9_]+)\}\}',lambda m:str(data.get(m.group(1),'')) if isinstance(data,dict) else '',obj)
+VAR=re.compile(r'{{\s*payload\.([a-zA-Z0-9_.-]+)\s*}}')
+def map_text(s,payload):
+    def get(m):
+        cur=payload
+        for p in m.group(1).split('.'):
+            if not isinstance(cur,dict):return ''
+            cur=cur.get(p,'')
+        return str(cur) if not isinstance(cur,(dict,list)) else json.dumps(cur,ensure_ascii=False)
+    return VAR.sub(get,str(s))
+def mapped_body(raw,payload):
+    s=map_text(raw or '{}',payload)
+    try:return json.loads(s)
+    except ValueError:raise ValueError('Некоректний JSON після підстановки полів')
 
-def run_workflow(item,data,source):
-    status='success'; detail=''
+def validate_public_url(url):
+    p=urlparse(url)
+    if p.scheme!='https' or not p.hostname or p.username or p.password:raise ValueError('Потрібен публічний HTTPS URL')
+    if p.port not in (None,443):raise ValueError('Дозволений лише HTTPS порт 443')
+    for info in socket.getaddrinfo(p.hostname,443,type=socket.SOCK_STREAM):
+        ip=ipaddress.ip_address(info[4][0]);
+        if not ip.is_global:raise ValueError('Приватні та локальні адреси заборонені')
+    # DNS rebinding remains possible between validation and requests. Do not treat this as a hardened SSRF boundary.
+    return url
+
+def send(url,method='POST',headers=None,body=None):
+    validate_public_url(url)
     try:
-        # Re-resolve at dispatch. Production deployments should add egress firewall or DNS-pinned transport.
-        validate_destination(item['destination'])
-        headers=json.loads(item['headers']); body=interpolate(json.loads(item['payload']),data)
-        # No redirects to unvalidated destinations.
-        r=requests.request(item['method'],item['destination'],json=body,headers=headers,timeout=12,allow_redirects=False)
-        r.raise_for_status();detail=f'HTTP {r.status_code}'
+        r=requests.request(method,url,headers=headers or {},json=body,timeout=20,allow_redirects=False)
+        return r.status_code, r.text[:400]
+    except requests.RequestException as e:raise ValueError(f'HTTP-запит не вдався: {str(e)[:180]}')
+def execute(w,payload):
+    cfg=json.loads(w.config);kind=w.action
+    token=fernet.decrypt(w.connection.secret.encode()).decode() if w.connection else ''
+    if kind=='http':
+        url=map_text(cfg.get('url',''),payload)
+        hdr=json.loads(map_text(cfg.get('headers') or '{}',payload))
+        if token:hdr['Authorization']='Bearer '+token
+        return send(url,cfg.get('method','POST').upper(),hdr,mapped_body(cfg.get('body'),payload))
+    if kind=='telegram':
+        if not token:raise ValueError('Потрібне підключення Telegram')
+        return send('https://api.telegram.org/bot'+token+'/sendMessage',body={'chat_id':map_text(cfg['chat_id'],payload),'text':map_text(cfg['message'],payload)})
+    if kind=='openai':
+        if not token:raise ValueError('Потрібен ключ OpenAI')
+        return send('https://api.openai.com/v1/responses',headers={'Authorization':'Bearer '+token},body={'model':'gpt-4.1-mini','input':map_text(cfg['prompt'],payload)})
+    if kind=='sheets':
+        if not token:raise ValueError('Потрібен Google OAuth access token')
+        sid=cfg['spreadsheet_id'];rang=cfg.get('range') or 'Sheet1!A:Z'
+        if not re.fullmatch(r'[a-zA-Z0-9_-]{15,}',sid):raise ValueError('Некоректний spreadsheet ID')
+        from urllib.parse import quote
+        url=f'https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{quote(rang,safe="")}\u003aappend?valueInputOption=USER_ENTERED'
+        return send(url,headers={'Authorization':'Bearer '+token},body=mapped_body(cfg.get('body') or '{"values":[["{{payload.name}}"]]}',payload))
+    if kind=='gmail':
+        if not token:raise ValueError('Потрібен Google OAuth access token')
+        from email.message import EmailMessage
+        import base64
+        msg=EmailMessage();msg['To']=map_text(cfg['to'],payload);msg['Subject']=map_text(cfg['subject'],payload);msg.set_content(map_text(cfg['message'],payload))
+        raw=base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        return send('https://gmail.googleapis.com/gmail/v1/users/me/messages/send',headers={'Authorization':'Bearer '+token},body={'raw':raw})
+    if kind=='facebook':
+        if not token:raise ValueError('Потрібен Page access token')
+        pid=cfg['page_id']
+        if not pid.isdigit():raise ValueError('Некоректний Page ID')
+        return send('https://graph.facebook.com/v23.0/'+pid+'/feed',headers={'Authorization':'Bearer '+token},body={'message':map_text(cfg['message'],payload)})
+    raise ValueError('Невідома дія')
+
+def run_workflow(w,payload):
+    if not w.enabled:return {'error':'Сценарій вимкнено'},409
+    try:
+        code,message=execute(w,payload);ok=200<=code<300
+        status='success' if ok else 'error'
+        # Do not store response bodies: APIs can return sensitive user data.
+        db.session.add(Run(workflow_id=w.id,status=status,message=f'HTTP {code}'))
+        db.session.commit()
+        return {'status':status,'http_status':code},200 if ok else 502
     except Exception as e:
-        status='error';detail=str(e)[:450]
-    with db() as c: c.execute('INSERT INTO runs(workflow_id,timestamp,source,status,detail) VALUES(?,?,?,?,?)',(item['id'],datetime.now(timezone.utc).isoformat(),source,status,detail))
-    return status,detail
-
+        db.session.add(Run(workflow_id=w.id,status='error',message=type(e).__name__+': '+str(e)[:160]));db.session.commit()
+        return {'status':'error','message':str(e)[:160]},400
 @app.post('/hook/<token>')
-def webhook(token):
-    with db() as c: item=c.execute('SELECT * FROM workflows WHERE token=? AND enabled=1',(token,)).fetchone()
-    if not item: abort(404)
-    data=request.get_json(silent=True)
-    if not isinstance(data,(dict,list)): return jsonify(error='JSON object or array required'),400
-    status,detail=run_workflow(item,data,'webhook')
-    return jsonify(status=status,detail=detail),200 if status=='success' else 502
-
-@app.post('/workflows/<int:wid>/run')
+def hook(token):
+    w=Workflow.query.filter_by(trigger_token=token).first_or_404()
+    payload=request.get_json(silent=True)
+    if not isinstance(payload,dict):return {'error':'Очікується JSON object'},400
+    return run_workflow(w,payload)
+@app.post('/workflows/<int:wid>/test')
 @login_required
-def manual_run(wid):
-    with db() as c: item=c.execute('SELECT * FROM workflows WHERE id=?',(wid,)).fetchone()
-    if not item: abort(404)
-    try:
-        data=json.loads(request.form.get('data','{}'))
-        status,detail=run_workflow(item,data,'manual')
-        flash(f'Тест: {status} — {detail}')
-    except ValueError as e: flash('Некоректний JSON: '+str(e))
-    return redirect(url_for('edit_workflow',wid=wid))
-
-HISTORY='''<div class="top"><div><h1>Історія запусків</h1><p>Останні 100 виконань. Час у UTC.</p></div></div><div class="card">{% if runs %}<table><thead><tr><th>Час</th><th>Сценарій</th><th>Джерело</th><th>Статус</th><th>Деталі</th></tr></thead><tbody>{% for r in runs %}<tr><td class="muted">{{r.timestamp[:19]}}</td><td>{{r.name}}</td><td>{{r.source}}</td><td><span class="tag {{'off' if r.status=='error'}}">{{r.status}}</span></td><td class="mono">{{r.detail}}</td></tr>{% endfor %}</tbody></table>{% else %}<p>Поки немає запусків.</p>{% endif %}</div>'''
-@app.get('/history')
+def test(wid):
+    w=db.get_or_404(Workflow,wid)
+    try:payload=json.loads(request.form.get('sample','{}'));assert isinstance(payload,dict)
+    except (ValueError,AssertionError):flash('Введи коректний JSON object','error');return redirect(url_for('workflow_detail',wid=wid))
+    result,code=run_workflow(w,payload);flash(f'Тест: {result}', 'success' if code==200 else 'error');return redirect(url_for('workflow_detail',wid=wid))
+@app.route('/runs')
 @login_required
-def history():
-    with db() as c: runs=c.execute('SELECT r.*,w.name FROM runs r JOIN workflows w ON r.workflow_id=w.id ORDER BY r.id DESC LIMIT 100').fetchall()
-    return page(HISTORY,runs=runs)
+def runs():return render_template('runs.html',items=Run.query.order_by(Run.id.desc()).limit(150).all())
+@app.route('/settings')
+@login_required
+def settings():return render_template('settings.html',db_type='PostgreSQL' if rawdb.startswith('postgresql') else 'SQLite')
 
-@app.get('/health')
-def health():return jsonify(ok=True)
-if __name__=='__main__': app.run(port=8000,debug=False)
+if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','10000')))
