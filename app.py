@@ -25,7 +25,8 @@ ADMIN=os.environ.get('ADMIN_USERNAME','admin')
 PASSWORD=os.environ.get('ADMIN_PASSWORD','')
 FKEY=os.environ.get('ENCRYPTION_KEY','')
 if not PASSWORD: raise RuntimeError('Set ADMIN_PASSWORD in Render Environment')
-if not FKEY: raise RuntimeError('Set ENCRYPTION_KEY with a Fernet key in Render Environment')
+if not FKEY: raise RuntimeError('Set ENCRYPTION_KEY with a Fernet
+key in Render Environment')
 fernet=Fernet(FKEY.encode())
 
 class Connection(db.Model):
@@ -54,7 +55,9 @@ class Run(db.Model):
     created=db.Column(db.DateTime,default=lambda: datetime.now(timezone.utc))
     workflow=db.relationship('Workflow')
 
-with app.app_context(): db.create_all()
+if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()
 
 CATALOG=[('webhook','Webhook / API','Готовий тригер та універсальний HTTP-запит','ready'),('telegram','Telegram','Надіслати повідомлення через Bot API','ready'),('openai','OpenAI','Виконати запит до Responses API','ready'),('sheets','Google Sheets','Додати рядок у таблицю через OAuth access token','token'),('gmail','Gmail','Надіслати лист через OAuth access token','token'),('facebook','Facebook Pages','Створити допис на сторінці','token'),('instagram','Instagram','Публікація через Instagram Graph API','planned'),('googleads','Google Ads','Підготовлено місце під OAuth + developer token','planned'),('crm','CRM / Custom API','Універсальна передача даних у CRM через HTTP','ready')]
 
