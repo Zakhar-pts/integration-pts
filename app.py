@@ -25,7 +25,8 @@ ADMIN=os.environ.get('ADMIN_USERNAME','admin')
 PASSWORD=os.environ.get('ADMIN_PASSWORD','')
 FKEY=os.environ.get('ENCRYPTION_KEY','')
 if not PASSWORD: raise RuntimeError('Set ADMIN_PASSWORD in Render Environment')
-if not FKEY: raise RuntimeError('Set ENCRYPTION_KEY with a Fernet
+if not FKEY:
+    raise RuntimeError("Set ENCRYPTION_KEY with a Fernet key in Render Environment")
 key in Render Environment')
 fernet=Fernet(FKEY.encode())
 
