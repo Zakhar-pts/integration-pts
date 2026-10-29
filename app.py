@@ -29,7 +29,10 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS workflows (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, token TEXT UNIQUE NOT NULL, method TEXT NOT NULL DEFAULT 'POST', destination TEXT NOT NULL, headers TEXT NOT NULL DEFAULT '{}', payload TEXT NOT NULL DEFAULT '{{payload}}', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id INTEGER NOT NULL, timestamp TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, FOREIGN KEY(workflow_id) REFERENCES workflows(id))''')
         if not c.execute("SELECT 1 FROM settings WHERE key='admin_hash'").fetchone():
-            c.execute('INSERT INTO settings VALUES (?,?)',('admin_hash',generate_password_hash(PASSWORD)))
+           c.execute(
+    "INSERT OR IGNORE INTO settings VALUES (?,?)",
+    ('admin_hash', generate_password_hash(PASSWORD))
+)
 init_db()
 
 def authenticated(): return session.get('user')==ADMIN
